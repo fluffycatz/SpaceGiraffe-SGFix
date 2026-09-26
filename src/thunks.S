@@ -1,5 +1,6 @@
-/* SGFix: jmp thunks for exports forwarded to the real d3d9.dll. The real DLL is loaded lazily on
-   first use (EnsureReal), never inside DllMain. */
+/* SGFix: jmp thunks for exports forwarded to the real d3d9.dll. The real DLL is loaded on first
+   use, from whichever export is called first (possibly before DllMain), and the caller's return
+   address is passed along so the log can say who that was. */
     .text
     .macro FWD name
     .globl _thunk_\name
@@ -8,7 +9,9 @@ _thunk_\name:
     jne 1f
     push %ecx
     push %edx
-    call _EnsureReal
+    pushl 8(%esp)
+    call _EnsureRealFrom
+    add $4, %esp
     pop %edx
     pop %ecx
 1:  jmp *_p_\name

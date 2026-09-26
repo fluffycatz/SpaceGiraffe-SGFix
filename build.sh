@@ -1,9 +1,12 @@
 #!/bin/sh
-# Cross-compiles the 32-bit d3d9.dll proxy with MinGW-w64 (apt install g++-mingw-w64-i686-posix).
+# 32-bit d3d9.dll proxy, plain C, MinGW-w64 win32 thread model (apt install gcc-mingw-w64-i686-win32).
+# Linked without the MinGW CRT start-up files: the loader calls DllMain directly, there is no TLS
+# directory and nothing runs before DllMain except what the exports themselves do.
 set -e
-CXX=${CXX:-i686-w64-mingw32-g++}; CC=${CC:-i686-w64-mingw32-gcc}; OUT=${OUT:-build}
+CC=${CC:-i686-w64-mingw32-gcc-win32}; OUT=${OUT:-build}
 mkdir -p "$OUT"
-$CXX -std=c++17 -O2 -Wall -DUNICODE -D_UNICODE -c src/sgfix.cpp -o "$OUT/sgfix.o"
+$CC -std=c99 -O2 -Wall -DUNICODE -D_UNICODE -fno-asynchronous-unwind-tables -c src/sgfix.c -o "$OUT/sgfix.o"
 $CC -c src/thunks.S -o "$OUT/thunks.o"
-$CXX -shared -o "$OUT/d3d9.dll" "$OUT/sgfix.o" "$OUT/thunks.o" src/d3d9.def -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup
+$CC -shared -nostartfiles -o "$OUT/d3d9.dll" "$OUT/sgfix.o" "$OUT/thunks.o" src/d3d9.def \
+    -static-libgcc -Wl,-e,_DllMain@12 -Wl,--enable-stdcall-fixup -Wl,--exclude-all-symbols -Wl,--disable-runtime-pseudo-reloc -Wl,--disable-auto-import
 echo "built $OUT/d3d9.dll"
