@@ -1,9 +1,17 @@
-/* SGFix: jmp thunks for exports forwarded to the real d3d9.dll (pointers resolved in DllMain). */
+/* SGFix: jmp thunks for exports forwarded to the real d3d9.dll. The real DLL is loaded lazily on
+   first use (EnsureReal), never inside DllMain. */
     .text
     .macro FWD name
     .globl _thunk_\name
 _thunk_\name:
-    jmp *_p_\name
+    cmpl $0, _g_real_loaded
+    jne 1f
+    push %ecx
+    push %edx
+    call _EnsureReal
+    pop %edx
+    pop %ecx
+1:  jmp *_p_\name
     .endm
 FWD Direct3D9EnableMaximizedWindowedModeShim
 FWD Direct3DCreate9Ex

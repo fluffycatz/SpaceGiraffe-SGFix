@@ -16,7 +16,7 @@
 #include <map>
 #include <algorithm>
 
-#define SGFIX_VERSION "1.0.0"
+#define SGFIX_VERSION "1.0.1"
 
 // ---------------------------------------------------------------------------------------------
 // config + log
@@ -27,21 +27,42 @@ struct Config {
     int force_refresh = 0;        // if > 0: overwrite FullScreen_RefreshRateInHz in CreateDevice/Reset
     int present_interval = -1;    // if >= 0: overwrite PresentationInterval (0 = immediate, 1 = one vsync)
     int log = 1;
+    int hooks = 1;                // 0 = pure forwarder (diagnostic)
 };
 static Config g_cfg;
 static wchar_t g_dir[MAX_PATH];
-static FILE* g_log = nullptr;
+static HANDLE g_log = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_cs;
 static HMODULE g_real = nullptr;
+extern "C" { int g_real_loaded = 0; }
+
+static void LogOpen()
+{
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%ssgfix.log", g_dir);
+    g_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_log == INVALID_HANDLE_VALUE) {
+        wchar_t tmp[MAX_PATH];
+        if (GetEnvironmentVariableW(L"TEMP", tmp, MAX_PATH)) {
+            _snwprintf(path, MAX_PATH, L"%s\\sgfix.log", tmp);
+            g_log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+    }
+}
 
 static void Log(const char* fmt, ...)
 {
-    if (!g_log) return;
-    char buf[2048]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    char buf[2048]; va_list ap; va_start(ap, fmt); int n = vsnprintf(buf, sizeof buf - 3, fmt, ap); va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof buf - 3) n = (int)sizeof buf - 3;
+    buf[n++] = '\r'; buf[n++] = '\n'; buf[n] = 0;
+    OutputDebugStringA(buf);
+    if (g_log == INVALID_HANDLE_VALUE) return;
     EnterCriticalSection(&g_cs);
     SYSTEMTIME t; GetLocalTime(&t);
-    fprintf(g_log, "%02d:%02d:%02d.%03d %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, buf);
-    fflush(g_log);
+    char stamp[32]; int m = _snprintf(stamp, sizeof stamp, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    DWORD w; WriteFile(g_log, stamp, (DWORD)m, &w, nullptr); WriteFile(g_log, buf, (DWORD)n, &w, nullptr);
+    FlushFileBuffers(g_log);
     LeaveCriticalSection(&g_cs);
 }
 
@@ -61,6 +82,7 @@ static void LoadConfig()
     g_cfg.force_refresh    = (int)GetPrivateProfileIntW(L"sgfix", L"force_refresh", 0, ini);
     g_cfg.present_interval = (int)GetPrivateProfileIntW(L"sgfix", L"present_interval", -1, ini);
     g_cfg.log              = (int)GetPrivateProfileIntW(L"sgfix", L"log", 1, ini);
+    g_cfg.hooks            = (int)GetPrivateProfileIntW(L"sgfix", L"hooks", 1, ini);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -194,12 +216,14 @@ void WINAPI thunk_missing() { Log("FATAL: a forwarded d3d9 export is missing in 
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT);
 static PFN_Direct3DCreate9 real_Direct3DCreate9 = nullptr;
 
+void EnsureReal();
 IDirect3D9* WINAPI Direct3DCreate9(UINT sdk)
 {
-    if (!real_Direct3DCreate9) return nullptr;
+    EnsureReal();
+    if (!real_Direct3DCreate9) { Log("Direct3DCreate9: real function unavailable"); return nullptr; }
     IDirect3D9* d3d = real_Direct3DCreate9(sdk);
     Log("Direct3DCreate9(sdk %u) -> %p", sdk, (void*)d3d);
-    if (d3d) {
+    if (d3d && g_cfg.hooks) {
         static bool hooked = false;
         if (!hooked) {
             hooked = true;
@@ -207,23 +231,29 @@ IDirect3D9* WINAPI Direct3DCreate9(UINT sdk)
             Log("IDirect3D9 vtable hooked");
             D3DDISPLAYMODE dm = {}; if (SUCCEEDED(d3d->GetAdapterDisplayMode(0, &dm))) Log("desktop mode: %ux%u @%u Hz format %d", dm.Width, dm.Height, dm.RefreshRate, (int)dm.Format);
         }
-    }
+    } else if (d3d) Log("hooks=0: forwarding only");
     return d3d;
 }
 }
 
-static void ResolveForwards()
+extern "C" void EnsureReal()
 {
-    wchar_t sys[MAX_PATH], path[MAX_PATH];
-    GetSystemDirectoryW(sys, MAX_PATH);
-    _snwprintf(path, MAX_PATH, L"%s\\d3d9.dll", sys);
-    g_real = LoadLibraryW(path);
-    if (!g_real) { Log("FATAL: cannot load %ls (err %lu)", path, GetLastError()); return; }
-    Log("real d3d9.dll loaded from %ls", path);
-#define RESOLVE(n) p_##n = (void*)GetProcAddress(g_real, #n); if (!p_##n) { p_##n = (void*)&thunk_missing; Log("note: system d3d9.dll has no export %s", #n); }
-    FORWARDED(RESOLVE)
+    if (g_real_loaded) return;
+    EnterCriticalSection(&g_cs);
+    if (!g_real_loaded) {
+        wchar_t sys[MAX_PATH], path[MAX_PATH];
+        GetSystemDirectoryW(sys, MAX_PATH);
+        _snwprintf(path, MAX_PATH, L"%s\\d3d9.dll", sys);
+        g_real = LoadLibraryW(path);
+        if (!g_real) Log("FATAL: cannot load %ls (err %lu)", path, GetLastError());
+        else Log("real d3d9.dll loaded from %ls at %p", path, (void*)g_real);
+#define RESOLVE(n) p_##n = g_real ? (void*)GetProcAddress(g_real, #n) : nullptr; if (!p_##n) { p_##n = (void*)&thunk_missing; Log("note: system d3d9.dll has no export %s", #n); }
+        FORWARDED(RESOLVE)
 #undef RESOLVE
-    real_Direct3DCreate9 = (PFN_Direct3DCreate9)GetProcAddress(g_real, "Direct3DCreate9");
+        real_Direct3DCreate9 = g_real ? (PFN_Direct3DCreate9)GetProcAddress(g_real, "Direct3DCreate9") : nullptr;
+        g_real_loaded = 1;
+    }
+    LeaveCriticalSection(&g_cs);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
@@ -233,23 +263,16 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         InitializeCriticalSection(&g_cs);
         GetModuleFileNameW(inst, g_dir, MAX_PATH);
         wchar_t* s = wcsrchr(g_dir, L'\\'); if (s) s[1] = 0;
-        LoadConfig();
-        if (g_cfg.log) {
-            wchar_t path[MAX_PATH]; _snwprintf(path, MAX_PATH, L"%ssgfix.log", g_dir);
-            g_log = _wfopen(path, L"w");
-            if (!g_log) {
-                wchar_t base[MAX_PATH];
-                if (GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) { _snwprintf(path, MAX_PATH, L"%s\\SGFix", base); CreateDirectoryW(path, nullptr); _snwprintf(path, MAX_PATH, L"%s\\SGFix\\sgfix.log", base); g_log = _wfopen(path, L"w"); }
-            }
-        }
+        LogOpen();
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        Log("SGFix %s (d3d9.dll proxy) attached to %ls", SGFIX_VERSION, exe);
-        char pref[256] = ""; for (size_t i = 0; i < g_cfg.prefer.size(); i++) { char b[16]; snprintf(b, 16, "%s%d", i ? "," : "", g_cfg.prefer[i]); strncat(pref, b, sizeof pref - strlen(pref) - 1); }
-        Log("config: refresh preference [%s] keep_others=%d min %dx%d force_refresh=%d present_interval=%d", pref, g_cfg.keep_others, g_cfg.min_width, g_cfg.min_height, g_cfg.force_refresh, g_cfg.present_interval);
-        ResolveForwards();
+        Log("SGFix %s (d3d9.dll proxy) attached to %ls, dll at %p", SGFIX_VERSION, exe, (void*)inst);
+        LoadConfig();
+        char pref[256] = ""; for (size_t i = 0; i < g_cfg.prefer.size(); i++) { char b[16]; _snprintf(b, 16, "%s%d", i ? "," : "", g_cfg.prefer[i]); strncat(pref, b, sizeof pref - strlen(pref) - 1); }
+        Log("config: refresh preference [%s] keep_others=%d min %dx%d force_refresh=%d present_interval=%d hooks=%d", pref, g_cfg.keep_others, g_cfg.min_width, g_cfg.min_height, g_cfg.force_refresh, g_cfg.present_interval, g_cfg.hooks);
+        Log("DllMain done (real d3d9.dll is loaded on first use)");
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("detach");
-        if (g_log) fclose(g_log);
+        if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
     }
     return TRUE;
 }
