@@ -21,7 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SGFIX_VERSION "1.0.4"
+#define SGFIX_VERSION "1.1.0"
+/* {85C31227-3DE5-4f00-9B3A-F11AC38C18B5} = IID_IDirect3DTexture9 (defined here so no uuid library is needed) */
+static const GUID kIID_IDirect3DTexture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
 #define MAX_PREF 16
 #define MAX_LISTS 16
 #define MAX_MODES 2048
@@ -29,7 +31,9 @@
 /* ------------------------------------------------------------------------------------------ */
 /* config + log */
 static int   g_prefer[MAX_PREF]; static int g_npref = 0;
-static int   g_keep_others = 1, g_min_width = 0, g_min_height = 0, g_force_refresh = 0, g_present_interval = -1, g_logon = 1, g_hooks = 1;
+static int   g_keep_others = 0, g_min_width = 0, g_min_height = 0, g_force_refresh = 0, g_present_interval = -1, g_logon = 1, g_hooks = 1, g_capture_debug = 1;
+static int   g_dump_frame = 300, g_dump_count = 2, g_log_textures = 1;
+static WCHAR g_reshade[64];
 static WCHAR g_dir[MAX_PATH];
 static HANDLE g_log = INVALID_HANDLE_VALUE;
 static SRWLOCK g_lock = SRWLOCK_INIT;      /* zero-initialised: usable before DllMain */
@@ -90,7 +94,12 @@ static void LoadConfig(void)
         v = _wtoi(p); if (v > 0) g_prefer[g_npref++] = v;
         while (*p && *p != L',') p++;
     }
-    g_keep_others      = (int)GetPrivateProfileIntW(L"sgfix", L"keep_others", 1, ini);
+    g_keep_others      = (int)GetPrivateProfileIntW(L"sgfix", L"keep_others", 0, ini);
+    g_capture_debug    = (int)GetPrivateProfileIntW(L"sgfix", L"capture_debug", 1, ini);
+    g_dump_frame       = (int)GetPrivateProfileIntW(L"sgfix", L"dump_frame", 300, ini);
+    g_dump_count       = (int)GetPrivateProfileIntW(L"sgfix", L"dump_count", 2, ini);
+    g_log_textures     = (int)GetPrivateProfileIntW(L"sgfix", L"log_textures", 1, ini);
+    GetPrivateProfileStringW(L"sgfix", L"reshade", L"ReShade32.dll", g_reshade, 64, ini);
     g_min_width        = (int)GetPrivateProfileIntW(L"sgfix", L"min_width", 0, ini);
     g_min_height       = (int)GetPrivateProfileIntW(L"sgfix", L"min_height", 0, ini);
     g_force_refresh    = (int)GetPrivateProfileIntW(L"sgfix", L"force_refresh", 0, ini);
@@ -207,6 +216,148 @@ static void ApplyOverrides(D3DPRESENT_PARAMETERS* pp)
         Log("   override: presentation interval %#x -> %#x", pp->PresentationInterval, v); pp->PresentationInterval = v;
     }
 }
+static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp);
+/* ---- render-target / frame-structure logging (to find out at what resolution the game draws) */
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateRenderTarget)(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDepthStencilSurface)(IDirect3DDevice9*, UINT, UINT, D3DFORMAT, D3DMULTISAMPLE_TYPE, DWORD, BOOL, IDirect3DSurface9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_StretchRect)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetSamplerState)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrimitive)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrimitive)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Clear)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
+static PFN_CreateTexture orig_CreateTexture; static PFN_CreateRenderTarget orig_CreateRenderTarget; static PFN_CreateDepthStencilSurface orig_CreateDepthStencilSurface;
+static PFN_StretchRect orig_StretchRect; static PFN_SetRenderTarget orig_SetRenderTarget; static PFN_SetViewport orig_SetViewport; static PFN_SetTexture orig_SetTexture;
+static PFN_SetSamplerState orig_SetSamplerState; static PFN_DrawPrimitive orig_DrawPrimitive; static PFN_DrawIndexedPrimitive orig_DrawIndexedPrimitive;
+static PFN_DrawPrimitiveUP orig_DrawPrimitiveUP; static PFN_DrawIndexedPrimitiveUP orig_DrawIndexedPrimitiveUP; static PFN_Present orig_Present; static PFN_Clear orig_Clear;
+
+static UINT g_frame = 0; static int g_draws = 0, g_rtsets = 0, g_stretch = 0, g_clears = 0; static int g_dumping = 0, g_dump_left = 0, g_dump_req = 0; static int g_tex_logged = 0;
+static IDirect3DBaseTexture9* g_tex0 = NULL; static DWORD g_mag0 = 0xffff, g_min0 = 0xffff; static D3DVIEWPORT9 g_vp; static IDirect3DSurface9* g_rt0 = NULL;
+
+static const char* FmtName(D3DFORMAT f)
+{
+    switch (f) {
+    case D3DFMT_A8R8G8B8: return "A8R8G8B8"; case D3DFMT_X8R8G8B8: return "X8R8G8B8"; case D3DFMT_R5G6B5: return "R5G6B5"; case D3DFMT_A16B16G16R16F: return "A16B16G16R16F";
+    case D3DFMT_A32B32G32R32F: return "A32B32G32R32F"; case D3DFMT_R32F: return "R32F"; case D3DFMT_D24S8: return "D24S8"; case D3DFMT_D24X8: return "D24X8"; case D3DFMT_D16: return "D16";
+    case D3DFMT_A8: return "A8"; case D3DFMT_L8: return "L8"; case D3DFMT_DXT1: return "DXT1"; case D3DFMT_DXT3: return "DXT3"; case D3DFMT_DXT5: return "DXT5"; case D3DFMT_A2R10G10B10: return "A2R10G10B10";
+    case D3DFMT_G16R16F: return "G16R16F"; case D3DFMT_A8B8G8R8: return "A8B8G8R8"; case D3DFMT_X8B8G8R8: return "X8B8G8R8"; case D3DFMT_A1R5G5B5: return "A1R5G5B5";
+    default: { static char b[4][16]; static int i; char* s = b[i++ & 3]; _snprintf(s, 16, "fmt%d", (int)f); return s; }
+    }
+}
+static const char* SurfDesc(IDirect3DSurface9* s, char* buf, int n)
+{
+    D3DSURFACE_DESC d;
+    if (!s) { _snprintf(buf, n, "null"); return buf; }
+    if (FAILED(IDirect3DSurface9_GetDesc(s, &d))) { _snprintf(buf, n, "surface@%p", (void*)s); return buf; }
+    _snprintf(buf, n, "%ux%u %s%s%s", d.Width, d.Height, FmtName(d.Format), (d.Usage & D3DUSAGE_RENDERTARGET) ? " RT" : "", d.MultiSampleType ? " MSAA" : "");
+    return buf;
+}
+static const char* TexDesc(IDirect3DBaseTexture9* t, char* buf, int n)
+{
+    IDirect3DTexture9* tex = NULL; D3DSURFACE_DESC d;
+    if (!t) { _snprintf(buf, n, "none"); return buf; }
+    if (SUCCEEDED(IDirect3DBaseTexture9_QueryInterface(t, &kIID_IDirect3DTexture9, (void**)&tex)) && tex) {
+        if (SUCCEEDED(IDirect3DTexture9_GetLevelDesc(tex, 0, &d))) _snprintf(buf, n, "tex %ux%u %s%s", d.Width, d.Height, FmtName(d.Format), (d.Usage & D3DUSAGE_RENDERTARGET) ? " RT" : "");
+        else _snprintf(buf, n, "tex@%p", (void*)t);
+        IDirect3DTexture9_Release(tex);
+    } else _snprintf(buf, n, "non-2D tex@%p", (void*)t);
+    return buf;
+}
+static const char* FilterName(DWORD f) { switch (f) { case D3DTEXF_NONE: return "none"; case D3DTEXF_POINT: return "point"; case D3DTEXF_LINEAR: return "linear"; case D3DTEXF_ANISOTROPIC: return "aniso"; default: return "?"; } }
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture9** out, HANDLE* sh)
+{
+    HRESULT hr = orig_CreateTexture(dev, w, h, levels, usage, fmt, pool, out, sh);
+    if (g_log_textures && ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DYNAMIC)) || w >= 512 || h >= 512) && g_tex_logged < 400) {
+        g_tex_logged++;
+        Log("CreateTexture %ux%u levels=%u usage=%#lx%s%s %s pool=%d -> %#lx (%p)", w, h, levels, usage, (usage & D3DUSAGE_RENDERTARGET) ? " RENDERTARGET" : "", (usage & D3DUSAGE_DYNAMIC) ? " DYNAMIC" : "", FmtName(fmt), (int)pool, (unsigned long)hr, out ? (void*)*out : NULL);
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_CreateRenderTarget(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms, DWORD msq, BOOL lockable, IDirect3DSurface9** out, HANDLE* sh)
+{
+    HRESULT hr = orig_CreateRenderTarget(dev, w, h, fmt, ms, msq, lockable, out, sh);
+    Log("CreateRenderTarget %ux%u %s ms=%d -> %#lx (%p)", w, h, FmtName(fmt), (int)ms, (unsigned long)hr, out ? (void*)*out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_CreateDepthStencilSurface(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms, DWORD msq, BOOL discard, IDirect3DSurface9** out, HANDLE* sh)
+{
+    HRESULT hr = orig_CreateDepthStencilSurface(dev, w, h, fmt, ms, msq, discard, out, sh);
+    Log("CreateDepthStencilSurface %ux%u %s ms=%d -> %#lx", w, h, FmtName(fmt), (int)ms, (unsigned long)hr);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_StretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src, const RECT* sr, IDirect3DSurface9* dst, const RECT* dr, D3DTEXTUREFILTERTYPE filter)
+{
+    g_stretch++;
+    if (g_dumping) { char a[64], b[64]; Log("   StretchRect %s%s -> %s%s filter=%s", SurfDesc(src, a, 64), sr ? " (rect)" : "", SurfDesc(dst, b, 64), dr ? " (rect)" : "", FilterName(filter)); }
+    return orig_StretchRect(dev, src, sr, dst, dr, filter);
+}
+static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx, IDirect3DSurface9* surf)
+{
+    if (idx == 0) g_rt0 = surf;
+    g_rtsets++;
+    if (g_dumping) { char a[64]; Log("   RT%lu <- %s", idx, SurfDesc(surf, a, 64)); }
+    return orig_SetRenderTarget(dev, idx, surf);
+}
+static HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9* dev, const D3DVIEWPORT9* vp)
+{
+    if (vp) g_vp = *vp;
+    if (g_dumping && vp) Log("   viewport <- %lux%lu @%lu,%lu", vp->Width, vp->Height, vp->X, vp->Y);
+    return orig_SetViewport(dev, vp);
+}
+static HRESULT STDMETHODCALLTYPE Hook_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirect3DBaseTexture9* t) { if (stage == 0) g_tex0 = t; return orig_SetTexture(dev, stage, t); }
+static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(IDirect3DDevice9* dev, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD v)
+{
+    if (sampler == 0) { if (type == D3DSAMP_MAGFILTER) g_mag0 = v; else if (type == D3DSAMP_MINFILTER) g_min0 = v; }
+    return orig_SetSamplerState(dev, sampler, type, v);
+}
+static HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9* dev, DWORD n, const D3DRECT* r, DWORD flags, D3DCOLOR c, float z, DWORD st)
+{
+    g_clears++;
+    if (g_dumping) { char a[64]; Log("   clear flags=%#lx color=%#lx on %s", flags, (unsigned long)c, SurfDesc(g_rt0, a, 64)); }
+    return orig_Clear(dev, n, r, flags, c, z, st);
+}
+static void LogDraw(const char* kind, D3DPRIMITIVETYPE pt, UINT count)
+{
+    char a[64], b[64];
+    g_draws++;
+    if (!g_dumping) return;
+    Log("   d%-3d %s type=%d prims=%u | RT=%s vp=%lux%lu | tex0=%s mag=%s min=%s", g_draws, kind, (int)pt, count, SurfDesc(g_rt0, a, 64), g_vp.Width, g_vp.Height, TexDesc(g_tex0, b, 64), FilterName(g_mag0), FilterName(g_min0));
+}
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT start, UINT count) { LogDraw("DrawPrimitive", pt, count); return orig_DrawPrimitive(dev, pt, start, count); }
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, INT bv, UINT mi, UINT nv, UINT si, UINT count) { LogDraw("DrawIndexedPrimitive", pt, count); return orig_DrawIndexedPrimitive(dev, pt, bv, mi, nv, si, count); }
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT count, const void* d, UINT stride) { LogDraw("DrawPrimitiveUP", pt, count); return orig_DrawPrimitiveUP(dev, pt, count, d, stride); }
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT mi, UINT nv, UINT count, const void* idx, D3DFORMAT ifmt, const void* vd, UINT stride) { LogDraw("DrawIndexedPrimitiveUP", pt, count); return orig_DrawIndexedPrimitiveUP(dev, pt, mi, nv, count, idx, ifmt, vd, stride); }
+static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* sr, const RECT* dr, HWND hwnd, const RGNDATA* dirty)
+{
+    static int k9 = 0; int n9; HRESULT hr;
+    n9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0; if (n9 && !k9) g_dump_req = 1; k9 = n9;
+    if (g_dumping) Log("---- end of frame %u: %d draws, %d clears, %d RT sets, %d StretchRects", g_frame, g_draws, g_clears, g_rtsets, g_stretch);
+    hr = orig_Present(dev, sr, dr, hwnd, dirty);
+    if (g_frame % 600 == 599) Log("stats: frame %u, last frame had %d draws, %d clears, %d RT sets, %d StretchRects", g_frame, g_draws, g_clears, g_rtsets, g_stretch);
+    if (g_dumping && --g_dump_left <= 0) g_dumping = 0;
+    g_frame++;
+    if (!g_dumping && (g_dump_req || (g_dump_frame > 0 && (int)g_frame == g_dump_frame))) { g_dump_req = 0; g_dumping = 1; g_dump_left = g_dump_count > 0 ? g_dump_count : 1; Log("==== dumping %d frame(s) starting with frame %u ====", g_dump_left, g_frame); }
+    g_draws = g_clears = g_rtsets = g_stretch = 0;
+    return hr;
+}
+static void HookDevice(IDirect3DDevice9* dev)
+{
+    void* o;
+#define HOOKD(idx, name) o = HookVtable(dev, idx, (void*)&Hook_##name); if (o) orig_##name = (PFN_##name)o;
+    HOOKD(16, Reset) HOOKD(17, Present) HOOKD(23, CreateTexture) HOOKD(28, CreateRenderTarget) HOOKD(29, CreateDepthStencilSurface)
+    HOOKD(34, StretchRect) HOOKD(37, SetRenderTarget) HOOKD(43, Clear) HOOKD(47, SetViewport) HOOKD(65, SetTexture) HOOKD(69, SetSamplerState)
+    HOOKD(81, DrawPrimitive) HOOKD(82, DrawIndexedPrimitive) HOOKD(83, DrawPrimitiveUP) HOOKD(84, DrawIndexedPrimitiveUP)
+#undef HOOKD
+    Log("IDirect3DDevice9 vtable hooked (render logging on; F9 dumps the next %d frames)", g_dump_count);
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
     HRESULT hr;
@@ -223,7 +374,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
     Log("CreateDevice(adapter %u, type %d, flags %#lx) -> %#lx", adapter, (int)type, flags, (unsigned long)hr);
     if (SUCCEEDED(hr) && out && *out) {
         D3DDISPLAYMODE dm;
-        if (!hooked) { void* o = HookVtable(*out, 16, (void*)&Hook_Reset); if (o) orig_Reset = (PFN_Reset)o; hooked = 1; }
+        if (!hooked) { hooked = 1; HookDevice(*out); }
         memset(&dm, 0, sizeof dm);
         if (SUCCEEDED(IDirect3DDevice9_GetDisplayMode(*out, 0, &dm))) Log("   device display mode now %ux%u @%u Hz format %d", dm.Width, dm.Height, dm.RefreshRate, (int)dm.Format);
     }
@@ -289,6 +440,13 @@ void __cdecl EnsureRealFrom(void* caller)
         WCHAR sys[MAX_PATH], path[MAX_PATH]; char who[300];
         LoadConfig();
         Log("call into d3d9.dll from %s (DllMain %s run yet)", ModuleNameOf(caller, who, sizeof who), g_dllmain_ran ? "has" : "has NOT");
+        if (g_reshade[0]) {                              /* optional ReShade (renamed, e.g. ReShade32.dll) next to the game */
+            HMODULE rs; _snwprintf(path, MAX_PATH, L"%s%s", g_dir, g_reshade);
+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+                rs = LoadLibraryW(path);
+                Log("ReShade: %ls %s", path, rs ? "loaded (it hooks the real d3d9.dll loaded next)" : "FAILED to load");
+            }
+        }
         GetSystemDirectoryW(sys, MAX_PATH);
         _snwprintf(path, MAX_PATH, L"%s\\d3d9.dll", sys);
         g_real = LoadLibraryW(path);
@@ -306,10 +464,60 @@ void __cdecl EnsureRealFrom(void* caller)
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+/* The game reports its video-mode decisions with OutputDebugStringA ("Mode : w %d h %d ref %d",
+   "Current video mode : ... SKIP %d" ...). Redirect the exe's import of it into our log. */
+typedef void (WINAPI *PFN_OutputDebugStringA)(LPCSTR);
+static PFN_OutputDebugStringA real_OutputDebugStringA = NULL;
+static void WINAPI Hook_OutputDebugStringA(LPCSTR str)
+{
+    if (str) {
+        char buf[1024]; size_t n = strlen(str); if (n >= sizeof buf) n = sizeof buf - 1;
+        memcpy(buf, str, n); buf[n] = 0;
+        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+        Log("[game] %s", buf);
+    }
+    if (real_OutputDebugStringA) real_OutputDebugStringA(str);
+}
+static void HookGameDebugOutput(void)
+{
+    static int done = 0;
+    HMODULE exe; IMAGE_DOS_HEADER* dos; IMAGE_NT_HEADERS* nt; IMAGE_DATA_DIRECTORY* dir; IMAGE_IMPORT_DESCRIPTOR* imp;
+    if (done || !g_capture_debug) return;
+    done = 1;
+    exe = GetModuleHandleW(NULL); dos = (IMAGE_DOS_HEADER*)exe;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    nt = (IMAGE_NT_HEADERS*)((char*)exe + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir->VirtualAddress) return;
+    for (imp = (IMAGE_IMPORT_DESCRIPTOR*)((char*)exe + dir->VirtualAddress); imp->Name; imp++) {
+        const char* dll = (const char*)exe + imp->Name;
+        IMAGE_THUNK_DATA* names; IMAGE_THUNK_DATA* iat; int i;
+        if (_stricmp(dll, "kernel32.dll") != 0 || !imp->OriginalFirstThunk) continue;
+        names = (IMAGE_THUNK_DATA*)((char*)exe + imp->OriginalFirstThunk);
+        iat = (IMAGE_THUNK_DATA*)((char*)exe + imp->FirstThunk);
+        for (i = 0; names[i].u1.AddressOfData; i++) {
+            IMAGE_IMPORT_BY_NAME* ibn;
+            if (IMAGE_SNAP_BY_ORDINAL(names[i].u1.Ordinal)) continue;
+            ibn = (IMAGE_IMPORT_BY_NAME*)((char*)exe + names[i].u1.AddressOfData);
+            if (strcmp((const char*)ibn->Name, "OutputDebugStringA") == 0) {
+                DWORD old, tmp;
+                if (VirtualProtect(&iat[i].u1.Function, sizeof(void*), PAGE_READWRITE, &old)) {
+                    if (!real_OutputDebugStringA) real_OutputDebugStringA = (PFN_OutputDebugStringA)(UINT_PTR)iat[i].u1.Function;
+                    iat[i].u1.Function = (UINT_PTR)&Hook_OutputDebugStringA;
+                    VirtualProtect(&iat[i].u1.Function, sizeof(void*), old, &tmp);
+                    Log("game debug output captured (OutputDebugStringA import redirected)");
+                }
+            }
+        }
+    }
+}
+
 IDirect3D9* WINAPI Direct3DCreate9(UINT sdk)
 {
     IDirect3D9* d3d; static int hooked = 0;
     EnsureRealFrom(__builtin_return_address(0));
+    HookGameDebugOutput();
     if (!real_Direct3DCreate9) { Log("Direct3DCreate9: real function unavailable"); return NULL; }
     d3d = real_Direct3DCreate9(sdk);
     Log("Direct3DCreate9(sdk %u) -> %p", sdk, (void*)d3d);
@@ -340,7 +548,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         GetModuleFileNameW(NULL, exe, MAX_PATH);
         Log("SGFix %s (d3d9.dll proxy) DllMain: attached to %ls, dll at %p%s", SGFIX_VERSION, exe, (void*)inst, g_real_loaded ? " (real d3d9 was already loaded by an earlier call)" : "");
         for (i = 0; i < g_npref; i++) { char b[16]; _snprintf(b, 16, "%s%d", i ? "," : "", g_prefer[i]); strncat(pref, b, sizeof pref - strlen(pref) - 1); }
-        Log("config: refresh preference [%s] keep_others=%d min %dx%d force_refresh=%d present_interval=%d hooks=%d", pref, g_keep_others, g_min_width, g_min_height, g_force_refresh, g_present_interval, g_hooks);
+        Log("config: refresh preference [%s] keep_others=%d min %dx%d force_refresh=%d present_interval=%d hooks=%d capture_debug=%d", pref, g_keep_others, g_min_width, g_min_height, g_force_refresh, g_present_interval, g_hooks, g_capture_debug);
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("detach");
         if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
