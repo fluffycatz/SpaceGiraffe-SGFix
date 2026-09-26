@@ -8,5 +8,5 @@ mkdir -p "$OUT"
 $CC -std=c99 -O2 -Wall -DUNICODE -D_UNICODE -fno-asynchronous-unwind-tables -c src/sgfix.c -o "$OUT/sgfix.o"
 $CC -c src/thunks.S -o "$OUT/thunks.o"
 $CC -shared -nostartfiles -o "$OUT/d3d9.dll" "$OUT/sgfix.o" "$OUT/thunks.o" src/d3d9.def \
-    -static-libgcc -luser32 -Wl,-e,_DllMain@12 -Wl,--enable-stdcall-fixup -Wl,--exclude-all-symbols -Wl,--disable-runtime-pseudo-reloc -Wl,--disable-auto-import
+    -static-libgcc -luser32 -Wl,-e,_DllMain@12 -Wl,--enable-stdcall-fixup -Wl,--exclude-all-symbols -Wl,--disable-runtime-pseudo-reloc -Wl,--disable-auto-import -Wl,--no-insert-timestamp -Wl,--image-base,0x10000000
 echo "built $OUT/d3d9.dll"

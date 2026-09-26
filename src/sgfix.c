@@ -102,7 +102,8 @@ static void LoadConfig(void)
     g_log_textures     = (int)GetPrivateProfileIntW(L"sgfix", L"log_textures", 1, ini);
     g_rt_scale         = (int)GetPrivateProfileIntW(L"sgfix", L"rt_scale", 4, ini);
     g_rt_max           = (int)GetPrivateProfileIntW(L"sgfix", L"rt_max", 1024, ini);
-    if (g_rt_scale < 1) g_rt_scale = 1; if (g_rt_scale > 8) g_rt_scale = 8;
+    if (g_rt_scale < 1) g_rt_scale = 1;
+    if (g_rt_scale > 8) g_rt_scale = 8;
     GetPrivateProfileStringW(L"sgfix", L"reshade", L"ReShade32.dll", g_reshade, 64, ini);
     g_min_width        = (int)GetPrivateProfileIntW(L"sgfix", L"min_width", 0, ini);
     g_min_height       = (int)GetPrivateProfileIntW(L"sgfix", L"min_height", 0, ini);
