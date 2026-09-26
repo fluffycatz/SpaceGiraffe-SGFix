@@ -13,7 +13,7 @@ normal DLL search order, and no memory of the game is ever written.
 
 The game builds its video-mode menu from 'IDirect3D9::GetAdapterModeCount' / 'EnumAdapterModes'
 (format 'D3DFMT_X8R8G8B8', 22). Direct3D returns modes grouped by resolution, and within a resolution
-in ascending refresh-rate order - on an LG G3 over HDMI 2.1 with an RTX 5090, 14 rates per resolution:
+in ascending refresh-rate order - on an LG G4 over HDMI 2.1 with an RTX 5090, 14 rates per resolution:
 
     real  3840x2160 @24 Hz … @30 @48 @50 @59 @60 @100 @119 @120 @144 Hz
 
@@ -196,4 +196,4 @@ shaders in use, texture 0 and its filters, plus every clear, viewport, scissor a
 The proxy was exercised under 32-bit Wine ('WINEDLLOVERRIDES="d3d9=n,b"', Xvfb + llvmpipe) with small
 test programs that reproduce what matters: mode enumeration through the proxy, the assembly thunks, the
 shim exports being called before 'DllMain', the IAT redirection, and a D3D9 program that renders through
-512×512 render targets with 'XYZRHW' quads the way the game does, run with and without scaling. Real-hardware validation: RTX 5090 + LG G3, 3840×2160 @ 60 Hz, ReShade 6.8.
+512×512 render targets with 'XYZRHW' quads the way the game does, run with and without scaling. Real-hardware validation: RTX 5090 + LG G4, 3840×2160 @ 60 Hz, ReShade 6.8.
