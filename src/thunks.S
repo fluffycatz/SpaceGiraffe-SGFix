@@ -1,6 +1,6 @@
 /* SGFix: jmp thunks for exports forwarded to the real d3d9.dll. The real DLL is loaded on first
-   use, from whichever export is called first (possibly before DllMain), and the caller's return
-   address is passed along so the log can say who that was. */
+   use (EnsureRealFrom); if it is not available the call ends in thunk_missing, which logs and
+   exits rather than jumping through a null pointer. */
     .text
     .macro FWD name
     .globl _thunk_\name
@@ -14,9 +14,10 @@ _thunk_\name:
     add $4, %esp
     pop %edx
     pop %ecx
+    cmpl $0, _g_real_loaded
+    je _thunk_missing@0
 1:  jmp *_p_\name
     .endm
-FWD Direct3D9EnableMaximizedWindowedModeShim
 FWD Direct3DCreate9Ex
 FWD Direct3DCreate9On12
 FWD Direct3DCreate9On12Ex

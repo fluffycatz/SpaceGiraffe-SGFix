@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SGFIX_VERSION "1.0.3"
+#define SGFIX_VERSION "1.0.4"
 #define MAX_PREF 16
 #define MAX_LISTS 16
 #define MAX_MODES 2048
@@ -233,7 +233,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
 /* ------------------------------------------------------------------------------------------ */
 /* exports */
 #define FORWARDED(X) \
-    X(Direct3D9EnableMaximizedWindowedModeShim) X(Direct3DCreate9Ex) X(Direct3DCreate9On12) X(Direct3DCreate9On12Ex) \
+    X(Direct3DCreate9Ex) X(Direct3DCreate9On12) X(Direct3DCreate9On12Ex) \
     X(Direct3DShaderValidatorCreate9) X(PSGPError) X(PSGPSampleTexture) \
     X(D3DPERF_BeginEvent) X(D3DPERF_EndEvent) X(D3DPERF_GetStatus) X(D3DPERF_QueryRepeatFrame) X(D3DPERF_SetMarker) \
     X(D3DPERF_SetOptions) X(D3DPERF_SetRegion) X(DebugSetLevel) X(DebugSetMute)
@@ -241,7 +241,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
 #define DECL_PTR(n) void* p_##n = NULL;
 FORWARDED(DECL_PTR)
 #undef DECL_PTR
-void WINAPI thunk_missing(void) { Log("FATAL: a forwarded d3d9 export is missing in the system d3d9.dll"); ExitProcess(0xD9D9); }
+void WINAPI thunk_missing(void) { Log("FATAL: a forwarded d3d9 export was called but the real d3d9.dll is not available"); ExitProcess(0xD9D9); }
 
 typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT);
 static PFN_Direct3DCreate9 real_Direct3DCreate9 = NULL;
@@ -256,6 +256,31 @@ static const char* ModuleNameOf(void* addr, char* buf, int n)
     return buf;
 }
 
+/* The Windows AppCompat shim engine (AcLayers.dll) calls the functions below during process
+   start-up, before any DllMain has run and while LoadLibrary is not yet usable. They are
+   therefore implemented natively: the call is recorded and replayed into the real d3d9.dll once
+   it has been loaded. (ReShade handles the same exports the same way.) */
+static int g_shim_pending = 0; static int g_shim_unknown = 0; static UINT g_shim_mode = 0;
+static void ForwardOrdinal(int ordinal, int a, UINT b, int nargs)
+{
+    FARPROC p;
+    if (!g_real_loaded || !g_real) return;
+    p = GetProcAddress(g_real, (LPCSTR)(UINT_PTR)ordinal);
+    if (!p) return;
+    if (nargs == 2) ((void (WINAPI*)(int, UINT))p)(a, b); else ((void (WINAPI*)(int))p)(a);
+}
+void WINAPI Direct3D9ForceHybridEnumeration(UINT mode)               { ForwardOrdinal(16, (int)mode, 0, 1); }
+void WINAPI Direct3D9SetMaximizedWindowedModeShim(int unknown, UINT mode)
+{
+    if (!g_real_loaded) { g_shim_pending = 1; g_shim_unknown = unknown; g_shim_mode = mode; return; }
+    ForwardOrdinal(17, unknown, mode, 2);
+}
+void WINAPI Direct3D9SetSwapEffectUpgradeShim(int unknown)           { ForwardOrdinal(18, unknown, 0, 1); }
+void WINAPI Direct3D9Force9on12(int unknown)                         { ForwardOrdinal(19, unknown, 0, 1); }
+void WINAPI Direct3D9SetMaximizedWindowHwndOverride(int unknown)     { ForwardOrdinal(22, unknown, 0, 1); }
+void WINAPI Direct3D9SetVendorIDLieFor9on12(int unknown)             { ForwardOrdinal(23, unknown, 0, 1); }
+void WINAPI Direct3D9EnableMaximizedWindowedModeShim(int unknown)    { Direct3D9SetMaximizedWindowedModeShim(unknown, 1); }
+
 void __cdecl EnsureRealFrom(void* caller)
 {
     if (g_real_loaded) return;
@@ -263,17 +288,20 @@ void __cdecl EnsureRealFrom(void* caller)
     if (!g_real_loaded) {
         WCHAR sys[MAX_PATH], path[MAX_PATH]; char who[300];
         LoadConfig();
-        Log("first call into d3d9.dll from %s (DllMain %s run yet)", ModuleNameOf(caller, who, sizeof who), g_dllmain_ran ? "has" : "has NOT");
+        Log("call into d3d9.dll from %s (DllMain %s run yet)", ModuleNameOf(caller, who, sizeof who), g_dllmain_ran ? "has" : "has NOT");
         GetSystemDirectoryW(sys, MAX_PATH);
         _snwprintf(path, MAX_PATH, L"%s\\d3d9.dll", sys);
         g_real = LoadLibraryW(path);
-        if (!g_real) Log("FATAL: cannot load %ls (err %lu)", path, GetLastError());
-        else Log("real d3d9.dll loaded from %ls at %p", path, (void*)g_real);
-#define RESOLVE(n) p_##n = g_real ? (void*)GetProcAddress(g_real, #n) : NULL; if (!p_##n) { p_##n = (void*)&thunk_missing; Log("note: system d3d9.dll has no export %s", #n); }
-        FORWARDED(RESOLVE)
+        if (!g_real) Log("cannot load %ls (err %lu)%s", path, GetLastError(), g_dllmain_ran ? "" : " - process still initialising, will retry on the next call");
+        else {
+            Log("real d3d9.dll loaded from %ls at %p", path, (void*)g_real);
+#define RESOLVE(n) p_##n = (void*)GetProcAddress(g_real, #n); if (!p_##n) { p_##n = (void*)&thunk_missing; Log("note: system d3d9.dll has no export %s", #n); }
+            FORWARDED(RESOLVE)
 #undef RESOLVE
-        real_Direct3DCreate9 = g_real ? (PFN_Direct3DCreate9)GetProcAddress(g_real, "Direct3DCreate9") : NULL;
-        g_real_loaded = 1;
+            real_Direct3DCreate9 = (PFN_Direct3DCreate9)GetProcAddress(g_real, "Direct3DCreate9");
+            g_real_loaded = 1;
+            if (g_shim_pending) { g_shim_pending = 0; Log("replaying Direct3D9SetMaximizedWindowedModeShim(%d, %u) recorded during start-up", g_shim_unknown, g_shim_mode); ForwardOrdinal(17, g_shim_unknown, g_shim_mode, 2); }
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
 }

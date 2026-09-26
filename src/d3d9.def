@@ -1,10 +1,9 @@
 LIBRARY d3d9.dll
 EXPORTS
     Direct3DCreate9 = Direct3DCreate9@4
-    Direct3D9EnableMaximizedWindowedModeShim = thunk_Direct3D9EnableMaximizedWindowedModeShim
     Direct3DCreate9Ex = thunk_Direct3DCreate9Ex
-    Direct3DCreate9On12 = thunk_Direct3DCreate9On12
-    Direct3DCreate9On12Ex = thunk_Direct3DCreate9On12Ex
+    Direct3DCreate9On12 = thunk_Direct3DCreate9On12 @20
+    Direct3DCreate9On12Ex = thunk_Direct3DCreate9On12Ex @21
     Direct3DShaderValidatorCreate9 = thunk_Direct3DShaderValidatorCreate9
     PSGPError = thunk_PSGPError
     PSGPSampleTexture = thunk_PSGPSampleTexture
@@ -17,3 +16,10 @@ EXPORTS
     D3DPERF_SetRegion = thunk_D3DPERF_SetRegion
     DebugSetLevel = thunk_DebugSetLevel
     DebugSetMute = thunk_DebugSetMute
+    Direct3D9ForceHybridEnumeration = Direct3D9ForceHybridEnumeration@4 @16 NONAME
+    Direct3D9SetMaximizedWindowedModeShim = Direct3D9SetMaximizedWindowedModeShim@8 @17 NONAME
+    Direct3D9SetSwapEffectUpgradeShim = Direct3D9SetSwapEffectUpgradeShim@4 @18 NONAME
+    Direct3D9Force9on12 = Direct3D9Force9on12@4 @19 NONAME
+    Direct3D9SetMaximizedWindowHwndOverride = Direct3D9SetMaximizedWindowHwndOverride@4 @22 NONAME
+    Direct3D9SetVendorIDLieFor9on12 = Direct3D9SetVendorIDLieFor9on12@4 @23 NONAME
+    Direct3D9EnableMaximizedWindowedModeShim = Direct3D9EnableMaximizedWindowedModeShim@4
