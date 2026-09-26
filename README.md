@@ -4,7 +4,7 @@ Two problems with Llamasoft's 2009 PC port of Space Giraffe on a modern machine,
 'd3d9.dll' proxy that sits between the game and Direct3D 9:
 
 1. **The video-mode menu offers only 50 Hz** for every resolution on many modern displays (4K TVs and
-High DPI monitors over HDMI in particular). SGFix hands the game a mode list with your preferred refresh
+high-refresh 4K monitors over HDMI in particular). SGFix hands the game a mode list with your preferred refresh
 rate - 60 Hz by default - as the *only* rate for each resolution, so that is what the menu shows and
 what the game runs at. The menu may still show @50hz at 4k as the only option after the mod is installed,
 but any framerate counter will show you that the game is now running at 60 fps after installing the patch.
