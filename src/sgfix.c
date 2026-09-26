@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SGFIX_VERSION "1.1.0"
+#define SGFIX_VERSION "1.2.0"
 /* {85C31227-3DE5-4f00-9B3A-F11AC38C18B5} = IID_IDirect3DTexture9 (defined here so no uuid library is needed) */
 static const GUID kIID_IDirect3DTexture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
 #define MAX_PREF 16
@@ -33,6 +33,7 @@ static const GUID kIID_IDirect3DTexture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b,
 static int   g_prefer[MAX_PREF]; static int g_npref = 0;
 static int   g_keep_others = 0, g_min_width = 0, g_min_height = 0, g_force_refresh = 0, g_present_interval = -1, g_logon = 1, g_hooks = 1, g_capture_debug = 1;
 static int   g_dump_frame = 300, g_dump_count = 2, g_log_textures = 1;
+static int   g_rt_scale = 4, g_rt_max = 1024;      /* render-target upscale factor for the game's small offscreen targets */
 static WCHAR g_reshade[64];
 static WCHAR g_dir[MAX_PATH];
 static HANDLE g_log = INVALID_HANDLE_VALUE;
@@ -99,6 +100,9 @@ static void LoadConfig(void)
     g_dump_frame       = (int)GetPrivateProfileIntW(L"sgfix", L"dump_frame", 300, ini);
     g_dump_count       = (int)GetPrivateProfileIntW(L"sgfix", L"dump_count", 2, ini);
     g_log_textures     = (int)GetPrivateProfileIntW(L"sgfix", L"log_textures", 1, ini);
+    g_rt_scale         = (int)GetPrivateProfileIntW(L"sgfix", L"rt_scale", 4, ini);
+    g_rt_max           = (int)GetPrivateProfileIntW(L"sgfix", L"rt_max", 1024, ini);
+    if (g_rt_scale < 1) g_rt_scale = 1; if (g_rt_scale > 8) g_rt_scale = 8;
     GetPrivateProfileStringW(L"sgfix", L"reshade", L"ReShade32.dll", g_reshade, 64, ini);
     g_min_width        = (int)GetPrivateProfileIntW(L"sgfix", L"min_width", 0, ini);
     g_min_height       = (int)GetPrivateProfileIntW(L"sgfix", L"min_height", 0, ini);
@@ -232,13 +236,22 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrimitiveUP)(IDirect3DDevice9*, D3DP
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Clear)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetFVF)(IDirect3DDevice9*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVertexDeclaration)(IDirect3DDevice9*, IDirect3DVertexDeclaration9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetScissorRect)(IDirect3DDevice9*, const RECT*);
 static PFN_CreateTexture orig_CreateTexture; static PFN_CreateRenderTarget orig_CreateRenderTarget; static PFN_CreateDepthStencilSurface orig_CreateDepthStencilSurface;
 static PFN_StretchRect orig_StretchRect; static PFN_SetRenderTarget orig_SetRenderTarget; static PFN_SetViewport orig_SetViewport; static PFN_SetTexture orig_SetTexture;
 static PFN_SetSamplerState orig_SetSamplerState; static PFN_DrawPrimitive orig_DrawPrimitive; static PFN_DrawIndexedPrimitive orig_DrawIndexedPrimitive;
 static PFN_DrawPrimitiveUP orig_DrawPrimitiveUP; static PFN_DrawIndexedPrimitiveUP orig_DrawIndexedPrimitiveUP; static PFN_Present orig_Present; static PFN_Clear orig_Clear;
+static PFN_SetFVF orig_SetFVF; static PFN_SetVertexDeclaration orig_SetVertexDeclaration; static PFN_SetVertexShader orig_SetVertexShader; static PFN_SetPixelShader orig_SetPixelShader; static PFN_SetScissorRect orig_SetScissorRect;
 
 static UINT g_frame = 0; static int g_draws = 0, g_rtsets = 0, g_stretch = 0, g_clears = 0; static int g_dumping = 0, g_dump_left = 0, g_dump_req = 0; static int g_tex_logged = 0;
 static IDirect3DBaseTexture9* g_tex0 = NULL; static DWORD g_mag0 = 0xffff, g_min0 = 0xffff; static D3DVIEWPORT9 g_vp; static IDirect3DSurface9* g_rt0 = NULL;
+static DWORD g_fvf = 0; static IDirect3DVertexDeclaration9* g_vdecl = NULL; static IDirect3DVertexShader9* g_vs = NULL; static IDirect3DPixelShader9* g_ps = NULL;
+static int g_rt0_scaled = 0;                     /* current render target is one we enlarged */
+static int g_scaled_rts = 0;
 
 static const char* FmtName(D3DFORMAT f)
 {
@@ -273,7 +286,13 @@ static const char* FilterName(DWORD f) { switch (f) { case D3DTEXF_NONE: return 
 
 static HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DTexture9** out, HANDLE* sh)
 {
-    HRESULT hr = orig_CreateTexture(dev, w, h, levels, usage, fmt, pool, out, sh);
+    HRESULT hr; UINT ow = w, oh = h; int scaled = 0;
+    if (g_rt_scale > 1 && (usage & D3DUSAGE_RENDERTARGET) && pool == D3DPOOL_DEFAULT && (int)w <= g_rt_max && (int)h <= g_rt_max && w >= 64 && h >= 64) {
+        w *= g_rt_scale; h *= g_rt_scale; scaled = 1;
+    }
+    hr = orig_CreateTexture(dev, w, h, levels, usage, fmt, pool, out, sh);
+    if (scaled && FAILED(hr)) { Log("CreateTexture %ux%u (scaled from %ux%u) failed %#lx - retrying at the original size", w, h, ow, oh, (unsigned long)hr); w = ow; h = oh; scaled = 0; hr = orig_CreateTexture(dev, w, h, levels, usage, fmt, pool, out, sh); }
+    if (scaled && SUCCEEDED(hr)) { g_scaled_rts++; if (g_scaled_rts <= 60) Log("render target %ux%u enlarged to %ux%u (x%d)", ow, oh, w, h, g_rt_scale); }
     if (g_log_textures && ((usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DYNAMIC)) || w >= 512 || h >= 512) && g_tex_logged < 400) {
         g_tex_logged++;
         Log("CreateTexture %ux%u levels=%u usage=%#lx%s%s %s pool=%d -> %#lx (%p)", w, h, levels, usage, (usage & D3DUSAGE_RENDERTARGET) ? " RENDERTARGET" : "", (usage & D3DUSAGE_DYNAMIC) ? " DYNAMIC" : "", FmtName(fmt), (int)pool, (unsigned long)hr, out ? (void*)*out : NULL);
@@ -300,7 +319,12 @@ static HRESULT STDMETHODCALLTYPE Hook_StretchRect(IDirect3DDevice9* dev, IDirect
 }
 static HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx, IDirect3DSurface9* surf)
 {
-    if (idx == 0) g_rt0 = surf;
+    if (idx == 0) {
+        D3DSURFACE_DESC d;
+        g_rt0 = surf; g_rt0_scaled = 0;
+        if (surf && g_rt_scale > 1 && SUCCEEDED(IDirect3DSurface9_GetDesc(surf, &d)) && (d.Usage & D3DUSAGE_RENDERTARGET) && d.Pool == D3DPOOL_DEFAULT && d.Format == D3DFMT_A8R8G8B8
+            && (int)d.Width <= g_rt_max * g_rt_scale && (int)d.Height <= g_rt_max * g_rt_scale && (d.Width % g_rt_scale) == 0 && (int)d.Width / g_rt_scale >= 64) g_rt0_scaled = 1;
+    }
     g_rtsets++;
     if (g_dumping) { char a[64]; Log("   RT%lu <- %s", idx, SurfDesc(surf, a, 64)); }
     return orig_SetRenderTarget(dev, idx, surf);
@@ -312,6 +336,31 @@ static HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9* dev, const D
     return orig_SetViewport(dev, vp);
 }
 static HRESULT STDMETHODCALLTYPE Hook_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirect3DBaseTexture9* t) { if (stage == 0) g_tex0 = t; return orig_SetTexture(dev, stage, t); }
+static HRESULT STDMETHODCALLTYPE Hook_SetFVF(IDirect3DDevice9* dev, DWORD fvf) { g_fvf = fvf; g_vdecl = NULL; return orig_SetFVF(dev, fvf); }
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexDeclaration(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9* d) { g_vdecl = d; if (d) g_fvf = 0; return orig_SetVertexDeclaration(dev, d); }
+static HRESULT STDMETHODCALLTYPE Hook_SetVertexShader(IDirect3DDevice9* dev, IDirect3DVertexShader9* v) { g_vs = v; return orig_SetVertexShader(dev, v); }
+static HRESULT STDMETHODCALLTYPE Hook_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelShader9* p) { g_ps = p; return orig_SetPixelShader(dev, p); }
+static HRESULT STDMETHODCALLTYPE Hook_SetScissorRect(IDirect3DDevice9* dev, const RECT* r)
+{
+    RECT sr;
+    if (g_dumping && r) Log("   scissor <- (%ld,%ld)-(%ld,%ld)%s", r->left, r->top, r->right, r->bottom, g_rt0_scaled ? " [scaled]" : "");
+    if (r && g_rt0_scaled) { sr.left = r->left * g_rt_scale; sr.top = r->top * g_rt_scale; sr.right = r->right * g_rt_scale; sr.bottom = r->bottom * g_rt_scale; return orig_SetScissorRect(dev, &sr); }
+    return orig_SetScissorRect(dev, r);
+}
+/* Vertex data of pre-transformed (XYZRHW) draws is in render-target pixels: scale it for enlarged targets. */
+static int PreTransformed(void) { return g_vdecl == NULL && (g_fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW; }
+static void* ScaleUP(const void* data, UINT nverts, UINT stride, void* buf, UINT bufsize)
+{
+    UINT i; char* d; float f = (float)g_rt_scale;
+    if (!data || !stride || nverts * stride > bufsize) return NULL;
+    memcpy(buf, data, nverts * stride); d = (char*)buf;
+    for (i = 0; i < nverts; i++) { float* v = (float*)(d + i * stride); v[0] *= f; v[1] *= f; }
+    return buf;
+}
+static UINT VertsForPrims(D3DPRIMITIVETYPE pt, UINT prims)
+{
+    switch (pt) { case D3DPT_POINTLIST: return prims; case D3DPT_LINELIST: return prims * 2; case D3DPT_LINESTRIP: return prims + 1; case D3DPT_TRIANGLELIST: return prims * 3; case D3DPT_TRIANGLESTRIP: case D3DPT_TRIANGLEFAN: return prims + 2; default: return 0; }
+}
 static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(IDirect3DDevice9* dev, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD v)
 {
     if (sampler == 0) { if (type == D3DSAMP_MAGFILTER) g_mag0 = v; else if (type == D3DSAMP_MINFILTER) g_min0 = v; }
@@ -319,8 +368,13 @@ static HRESULT STDMETHODCALLTYPE Hook_SetSamplerState(IDirect3DDevice9* dev, DWO
 }
 static HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9* dev, DWORD n, const D3DRECT* r, DWORD flags, D3DCOLOR c, float z, DWORD st)
 {
+    D3DRECT sr[8]; DWORD i;
     g_clears++;
-    if (g_dumping) { char a[64]; Log("   clear flags=%#lx color=%#lx on %s", flags, (unsigned long)c, SurfDesc(g_rt0, a, 64)); }
+    if (g_dumping) { char a[64]; Log("   clear flags=%#lx color=%#lx rects=%lu on %s%s", flags, (unsigned long)c, n, SurfDesc(g_rt0, a, 64), g_rt0_scaled ? " [scaled]" : ""); }
+    if (n && r && g_rt0_scaled && n <= 8) {
+        for (i = 0; i < n; i++) { sr[i].x1 = r[i].x1 * g_rt_scale; sr[i].y1 = r[i].y1 * g_rt_scale; sr[i].x2 = r[i].x2 * g_rt_scale; sr[i].y2 = r[i].y2 * g_rt_scale; }
+        return orig_Clear(dev, n, sr, flags, c, z, st);
+    }
     return orig_Clear(dev, n, r, flags, c, z, st);
 }
 static void LogDraw(const char* kind, D3DPRIMITIVETYPE pt, UINT count)
@@ -328,12 +382,30 @@ static void LogDraw(const char* kind, D3DPRIMITIVETYPE pt, UINT count)
     char a[64], b[64];
     g_draws++;
     if (!g_dumping) return;
-    Log("   d%-3d %s type=%d prims=%u | RT=%s vp=%lux%lu | tex0=%s mag=%s min=%s", g_draws, kind, (int)pt, count, SurfDesc(g_rt0, a, 64), g_vp.Width, g_vp.Height, TexDesc(g_tex0, b, 64), FilterName(g_mag0), FilterName(g_min0));
+    Log("   d%-3d %s type=%d prims=%u | RT=%s%s | %s vs=%s ps=%s | tex0=%s mag=%s min=%s", g_draws, kind, (int)pt, count, SurfDesc(g_rt0, a, 64), g_rt0_scaled ? " [scaled]" : "",
+        g_vdecl ? "vdecl" : (PreTransformed() ? "XYZRHW" : "fvf"), g_vs ? "yes" : "no", g_ps ? "yes" : "no", TexDesc(g_tex0, b, 64), FilterName(g_mag0), FilterName(g_min0));
 }
-static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT start, UINT count) { LogDraw("DrawPrimitive", pt, count); return orig_DrawPrimitive(dev, pt, start, count); }
+static int g_warned_vb = 0;
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT start, UINT count)
+{
+    LogDraw("DrawPrimitive", pt, count);
+    if (g_rt0_scaled && PreTransformed() && !g_warned_vb) { g_warned_vb = 1; Log("WARNING: pre-transformed vertex-buffer draw into an enlarged render target (cannot be scaled) - set rt_scale=1 if the picture is wrong"); }
+    return orig_DrawPrimitive(dev, pt, start, count);
+}
 static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, INT bv, UINT mi, UINT nv, UINT si, UINT count) { LogDraw("DrawIndexedPrimitive", pt, count); return orig_DrawIndexedPrimitive(dev, pt, bv, mi, nv, si, count); }
-static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT count, const void* d, UINT stride) { LogDraw("DrawPrimitiveUP", pt, count); return orig_DrawPrimitiveUP(dev, pt, count, d, stride); }
-static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT mi, UINT nv, UINT count, const void* idx, D3DFORMAT ifmt, const void* vd, UINT stride) { LogDraw("DrawIndexedPrimitiveUP", pt, count); return orig_DrawIndexedPrimitiveUP(dev, pt, mi, nv, count, idx, ifmt, vd, stride); }
+static char g_upbuf[65536];
+static HRESULT STDMETHODCALLTYPE Hook_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT count, const void* d, UINT stride)
+{
+    LogDraw("DrawPrimitiveUP", pt, count);
+    if (g_rt0_scaled && PreTransformed()) { void* sd = ScaleUP(d, VertsForPrims(pt, count), stride, g_upbuf, sizeof g_upbuf); if (sd) return orig_DrawPrimitiveUP(dev, pt, count, sd, stride); }
+    return orig_DrawPrimitiveUP(dev, pt, count, d, stride);
+}
+static HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE pt, UINT mi, UINT nv, UINT count, const void* idx, D3DFORMAT ifmt, const void* vd, UINT stride)
+{
+    LogDraw("DrawIndexedPrimitiveUP", pt, count);
+    if (g_rt0_scaled && PreTransformed()) { void* sd = ScaleUP(vd, mi + nv, stride, g_upbuf, sizeof g_upbuf); if (sd) return orig_DrawIndexedPrimitiveUP(dev, pt, mi, nv, count, idx, ifmt, sd, stride); }
+    return orig_DrawIndexedPrimitiveUP(dev, pt, mi, nv, count, idx, ifmt, vd, stride);
+}
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* sr, const RECT* dr, HWND hwnd, const RGNDATA* dirty)
 {
     static int k9 = 0; int n9; HRESULT hr;
@@ -354,8 +426,9 @@ static void HookDevice(IDirect3DDevice9* dev)
     HOOKD(16, Reset) HOOKD(17, Present) HOOKD(23, CreateTexture) HOOKD(28, CreateRenderTarget) HOOKD(29, CreateDepthStencilSurface)
     HOOKD(34, StretchRect) HOOKD(37, SetRenderTarget) HOOKD(43, Clear) HOOKD(47, SetViewport) HOOKD(65, SetTexture) HOOKD(69, SetSamplerState)
     HOOKD(81, DrawPrimitive) HOOKD(82, DrawIndexedPrimitive) HOOKD(83, DrawPrimitiveUP) HOOKD(84, DrawIndexedPrimitiveUP)
+    HOOKD(75, SetScissorRect) HOOKD(87, SetVertexDeclaration) HOOKD(89, SetFVF) HOOKD(92, SetVertexShader) HOOKD(107, SetPixelShader)
 #undef HOOKD
-    Log("IDirect3DDevice9 vtable hooked (render logging on; F9 dumps the next %d frames)", g_dump_count);
+    Log("IDirect3DDevice9 vtable hooked (render logging on; F9 dumps the next %d frames; rt_scale=%d)", g_dump_count, g_rt_scale);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
